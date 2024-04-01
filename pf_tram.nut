@@ -83,8 +83,17 @@ function TramPathfinder::_Neighbours(self, path, cur_node) {
             next = AIBridge.GetOtherBridgeEnd(next);
             if(next != cur_node)
                 tiles.append([next, self._GetDirection(cur_node, next)]);
-        } else if(AIRoad.IsRoadTile(next))
-            tiles.append([next, self._GetDirection(cur_node, next)]);                             
+        } else if(AIRoad.IsRoadTile(next)) {
+            tiles.append([next, self._GetDirection(cur_node, next)]);
+        } else {
+            // IsRoadTile contains IsDriveThroughRoadStationTile, but only of the same road type
+            // so we need to switch to ROADTYPE_ROAD, as the road drive-through stations can have tram lines as well
+            // then get back to ROADTYPE_TRAM
+            AIRoad.SetCurrentRoadType(AIRoad.ROADTYPE_ROAD);
+            if(AIRoad.IsDriveThroughRoadStationTile(next))
+                tiles.append([next, self._GetDirection(cur_node, next)]);
+            AIRoad.SetCurrentRoadType(AIRoad.ROADTYPE_TRAM);
+        }
     }
     return tiles;
 }

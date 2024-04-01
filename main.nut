@@ -1,4 +1,5 @@
 require("pf_tram.nut");
+require("utils.nut");
 
 class TramAI extends AIController {
     constructor() {}
@@ -11,6 +12,8 @@ class TramAI extends AIController {
     _pf = TramPathfinder();
     /* List of tiles that won't be considered during search. */
     _ignored = AITileList();
+    /* Cache of vehicle group per town. */
+    _groups = AIList();
 }
 
 NORTH <- AIMap.GetTileIndex(0, -1);
@@ -43,11 +46,19 @@ function TramAI::Start() {
                 else
                     AIVehicle.SendVehicleToDepot(veh);
             }
-        
+
+        /* MAIN LOOP: Check all the towns with population greater than 1000. */
         local towns = AITownList();
         towns.Valuate(AITown.GetPopulation);
         towns.KeepAboveValue(1000);
         for(local town = towns.Begin(); !towns.IsEnd(); town = towns.Next()) {
+            /* Check rating first, if it's so low that we can't build remove all the stops and skip to next. */
+            local rating = AITown.GetRating(town, AICompany.COMPANY_SELF);
+            if(rating == AITown.TOWN_RATING_APPALLING || rating == AITown.TOWN_RATING_VERY_POOR) {
+                RemoveInfrastructure(town);
+                continue;
+            }
+
             local stops = FindTramStops(town);
             if(stops.Count() <= 1)
                 continue;
@@ -84,9 +95,106 @@ function TramAI::Start() {
                     AILog.Error("Failed to repay the loan: " + AIError.GetLastErrorString());
             }
         }
-        
+
+        /* Rating boosters. */
+        local trees_planted = PlantTreesIfRich();
+        if(trees_planted > 0)
+            AILog.Info("Planted " + trees_planted + " trees");
+        BuildHQ();
+
         this.Sleep(50);
     }
+}
+
+function TramAI::RemoveInfrastructure(town) {
+    /* Get vehicles in the town and sell them (if any). */
+    local group = GetGroup(town);
+    if(AIGroup.IsValidGroup(group)) {
+        local vehicles = AIVehicleList_Group(group);
+        if(!vehicles.IsEmpty()) {
+            /* Send to depot and sell what we can. */
+            for(local vehicle = vehicles.Begin(); !vehicles.IsEnd(); vehicle = vehicles.Next())
+                if(AIVehicle.IsStoppedInDepot(vehicle))
+                    AIVehicle.SellVehicle(vehicle);
+                else
+                    AIVehicle.SendVehicleToDepot(vehicle);
+
+            /* Check if there are still some vehicles left to sale. */
+            vehicles = AIVehicleList_Group(group);
+            if(!vehicles.IsEmpty())
+                return false;
+        } else
+            AIGroup.DeleteGroup(group);
+    }
+
+    /* Get infrastructure in the town. */
+    local stations = AIStationList(AIStation.STATION_BUS_STOP);
+    stations.Valuate(AIStation.GetNearestTown);
+    stations.KeepValue(town);
+
+    local depots = AIDepotList(AITile.TRANSPORT_ROAD);
+    depots.Valuate(AITile.GetTownAuthority);
+    depots.KeepValue(town);
+
+    local tracks = GetTownInfluencedArea(town);
+    tracks.Valuate(AIRoad.HasRoadType, AIRoad.ROADTYPE_TRAM);
+    tracks.KeepValue(1);
+    tracks.Valuate(AITile.GetTownAuthority);
+    tracks.KeepValue(town);
+    /* Unfortunately this gives us the owner of the road, not the track. */
+    //tracks.Valuate(AITile.GetOwner);
+    //tracks.KeepValue(AICompany.COMPANY_SELF);
+
+    if(stations.IsEmpty() && depots.IsEmpty() == 0 && tracks.IsEmpty() == 0)
+        return true;
+
+    //AILog.Info(AITown.GetName(town) + " infrastructure to remove: " + stations.Count() + " stations, " + depots.Count() + " depots, " + tracks.Count() + " tracks");
+
+    /* Remove all of the infrastructure. */
+    for(local station = stations.Begin(); !stations.IsEnd(); station = stations.Next()) {
+        WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_BUS_STOP));
+        if(!AIRoad.RemoveRoadStation(AIStation.GetLocation(station))) {
+            local err_str = AIError.GetLastErrorString();
+            AILog.Error("Failed to remove station " + AIStation.GetName(station) + ": " + err_str);
+            return false;
+        }
+    }
+
+    for(local depot = depots.Begin(); !depots.IsEnd(); depot = depots.Next()) {
+        WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_DEPOT));
+        if(!AIRoad.RemoveRoadDepot(depot)) {
+            local err_str = AIError.GetLastErrorString();
+            AILog.Error("Failed to remove depot in " + AITown.GetName(town) + ": " + err_str);
+            return false;
+        }
+    }
+
+    local track_removal_failed = false;
+    for(local track = tracks.Begin(); !tracks.IsEnd(); track = tracks.Next()) {
+        foreach(dir in [NORTH, WEST, SOUTH, EAST]) {
+            if(AIRoad.HasRoadType(track, AIRoad.ROADTYPE_TRAM)) {
+                WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_ROAD));
+                if(!AIRoad.RemoveRoad(track, track + dir)) {
+                    local err = AIError.GetLastError();
+                    /* It sucks, but we have no way of getting the owner of the tracks.
+                     * We also have no way of determining the direction of tracks not connected to anything (single tile).
+                     * So we brute force it here.
+                     */
+                    if(err != AIError.ERR_OWNED_BY_ANOTHER_COMPANY && err != AIError.ERR_UNKNOWN) {
+                        if(err != AIError.ERR_VEHICLE_IN_THE_WAY) {
+                            local err_str = AIError.GetLastErrorString();
+                            local x = AIMap.GetTileX(track);
+                            local y = AIMap.GetTileY(track);
+                            AILog.Error("Failed to remove track at (" + x + "," + y + "): " + err_str);
+                        }
+                        track_removal_failed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    return !track_removal_failed;
 }
 
 function __val__CanHaveTramStop(tile, town) {
@@ -120,31 +228,6 @@ function __val__CanHaveDepot(tile) {
          (AIRoad.IsRoadTile(tile + WEST) && AITile.GetSlope(tile + WEST) == AITile.SLOPE_FLAT && !AIRoad.IsDriveThroughRoadStationTile(tile + WEST)));
 }
 
-function TramAI::WaitToHaveEnoughMoney(cost) {
-    /* Have some margin, AICompany.GetQuarterlyExpenses returns negative value . */
-    local needed = cost + 2 * AICompany.GetLoanInterval() - AICompany.GetQuarterlyExpenses(AICompany.COMPANY_SELF, AICompany.CURRENT_QUARTER);
-    if(AICompany.GetBankBalance(AICompany.COMPANY_SELF) < needed && AICompany.GetLoanAmount() != AICompany.GetMaxLoanAmount()) {
-        local to_loan = ceil((needed - AICompany.GetBankBalance(AICompany.COMPANY_SELF)) / AICompany.GetLoanInterval().tofloat()).tointeger() * AICompany.GetLoanInterval();
-        if(!AICompany.SetLoanAmount(min(AICompany.GetLoanAmount() + to_loan, AICompany.GetMaxLoanAmount())))
-            AILog.Error("Failed to take a loan: " + AIError.GetLastErrorString());
-    }
-
-    while(cost + 2 * AICompany.GetLoanInterval() -
-          AICompany.GetQuarterlyExpenses(AICompany.COMPANY_SELF, AICompany.CURRENT_QUARTER) >
-          AICompany.GetBankBalance(AICompany.COMPANY_SELF)) {}
-}
-
-/* AITileList.AddRectangle with map size constraints. */
-function SafeAddRectangle(list, tile, range) {
-    local tile_x = AIMap.GetTileX(tile);
-    local tile_y = AIMap.GetTileY(tile);
-    local x1 = max(1, tile_x - range);
-    local y1 = max(1, tile_y - range);
-    local x2 = min(AIMap.GetMapSizeX() - 2, tile_x + range);
-    local y2 = min(AIMap.GetMapSizeY() - 2, tile_y + range);
-    list.AddRectangle(AIMap.GetTileIndex(x1, y1), AIMap.GetTileIndex(x2, y2)); 
-}
-
 function TramAI::IsDenselyPopulated(town, grid_center) {
     local tiles = AITileList();
     SafeAddRectangle(tiles, grid_center, this._station_radius);
@@ -159,8 +242,38 @@ function TramAI::IsDenselyPopulated(town, grid_center) {
     return tiles.Count() / (4 * this._station_radius * this._station_radius) > 0.9;
 }
 
-/* Get existing or build a new vehicle. */
-function GetVehicle(depot, stop) {          
+function TramAI::GetGroup(town) {
+    if(this._groups.HasItem(town))
+        return this._groups.GetValue(town);
+
+    local groups = AIGroupList();
+    local group_name = AITown.GetName(town) + " trams";
+    for(local group = groups.Begin(); !groups.IsEnd(); group = groups.Next()) {
+        if(AIGroup.GetName(group) == group_name) {
+            /* This can happen when we load game from save, cache entry is not yet filled. */
+            this._groups.AddItem(town, group);
+            return group;
+        }
+    }
+
+    local group = AIGroup.CreateGroup(AIVehicle.VT_ROAD);
+    if(!AIGroup.IsValidGroup(group)) {
+        AILog.Error("Failed to create a vehicle group: " + AIError.GetLastErrorString());
+        return -1;
+    }
+
+    if(!AIGroup.SetName(group, group_name)) {
+        AILog.Error("Failed to set name for the vehicle group: " + AIError.GetLastErrorString());
+        AIGroup.DeleteGroup(group);
+        return -1;
+    }
+
+    this._groups.AddItem(town, group);
+    return group;
+}
+
+/* Get existing or build a new vehicle for specific stop. */
+function TramAI::GetVehicle(town, depot, stop) {
     local station = AIStation.GetStationID(stop);
     if(!AIStation.IsValidStation(station))
         return -1;
@@ -169,7 +282,12 @@ function GetVehicle(depot, stop) {
     local vehicles = AIVehicleList_Station(station);
     if(vehicles.Count() > 0)
         return vehicles.Begin();
-        
+    
+    /* Get the group for all vehicles in this town. */
+    local group = GetGroup(town);
+    if(!AIGroup.IsValidGroup(group))
+        return -1;
+       
     /* Build new vehicle. */
     local engine = GetBestTram();
     if(!AIEngine.IsValidEngine(engine))
@@ -178,25 +296,39 @@ function GetVehicle(depot, stop) {
     local vehicle_price = AIEngine.GetPrice(engine);
     if(vehicle_price > 0)
         WaitToHaveEnoughMoney(vehicle_price);
-            
+
     local vehicle = AIVehicle.BuildVehicle(depot, engine);
     if(!AIVehicle.IsValidVehicle(vehicle)) {
         local err_str = AIError.GetLastErrorString();
         AILog.Error("Failed to build " + AIEngine.GetName(engine) + ": " + err_str);
         return -1;
     }
+
+    /* Move to the proper group. */
+    if(!AIGroup.MoveVehicle(group, vehicle)) {
+        AIVehicle.SellVehicle(vehicle);
+        AILog.Error("Failed to add tram to a group: " + AIError.GetLastErrorString());
+        return -1;
+    }
+
+    AILog.Info("New vehicle added for " + AIStation.GetName(station));
+
     return vehicle;
 }
 
-function PrepareVehicles(town, depot, stops) {
+function TramAI::PrepareVehicles(town, depot, stops) {
     for(local stop = stops.Begin(); !stops.IsEnd(); stop = stops.Next()) {
-        local vehicle = GetVehicle(depot, stop);
+        local vehicle = GetVehicle(town, depot, stop);
         if(vehicle == -1)
             return false;
     
-        /* Append orders. */
+        /* Append orders:
+         * 1. go to depot if maintenance needed
+         * 2. go to stop X
+         * 3. go to closest stop to stop X
+         */
         if(AIOrder.GetOrderCount(vehicle) == 0) {
-            AIOrder.UnshareOrders (vehicle);                
+            AIOrder.UnshareOrders(vehicle);
             local closest = AITileList();
             closest.AddList(stops);
             closest.RemoveTile(stop);
@@ -259,11 +391,12 @@ function TramAI::FindTramStops(town) {
 }
 
 function TramAI::BuildTramStops(stops) {
+    AIRoad.SetCurrentRoadType(AIRoad.ROADTYPE_TRAM);
     for(local stop = stops.Begin(); !stops.IsEnd(); stop = stops.Next()) {
         if(!AIStation.IsValidStation(AIStation.GetStationID(stop))) {
             local front = stop + SOUTH;
             local back = stop + NORTH;
-            if(AIRoad.IsRoadTile(stop + WEST)) {
+            if(AIRoad.IsRoadTile(stop + WEST) || AIRoad.IsDriveThroughRoadStationTile(stop + WEST)) {
                 front = stop + WEST;
                 back = stop + EAST;
             }
@@ -272,42 +405,43 @@ function TramAI::BuildTramStops(stops) {
             WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_BUS_STOP));
             if(!AIRoad.BuildDriveThroughRoadStation(stop, front, AIRoad.ROADVEHTYPE_BUS, AIStation.STATION_NEW)) {
                 local err = AIError.GetLastError();
+                local err_str = AIError.GetLastErrorString();
                 /* It seems that there is no way to detect all types of junctions. Trying to build a stop on 
-                   junction returns ERR_UNKNOWN, such tiles are ommited in the next search. */
-                if(err != AIError.ERR_UNKNOWN) {                    
-                    local err_str = AIError.GetLastErrorString();
-                    local x = AIMap.GetTileX(stop);
-                    local y = AIMap.GetTileY(stop);
-                    AILog.Error("Failed to build station at (" + x + "," + y + "): " + err_str);
+                   junction returns ERR_UNKNOWN, such tiles are ommited in the next search.
+                   Similar for drive through stations and tracks of other companies. We can detect them but it's easier to ignore them.
+                   */
+                if(err != AIError.ERR_UNKNOWN && err != AIError.ERR_OWNED_BY_ANOTHER_COMPANY && err != AIRoad.ERR_ROAD_DRIVE_THROUGH_WRONG_DIRECTION) {
+                    if(err != AIError.ERR_VEHICLE_IN_THE_WAY) {
+                        local err_str = AIError.GetLastErrorString();
+                        local x = AIMap.GetTileX(stop);
+                        local y = AIMap.GetTileY(stop);
+                        AILog.Error("Failed to build station at (" + x + "," + y + "): " + err_str);
+                        //AISign.BuildSign(stop, err_str);
+                    }
                 } else
                     this._ignored.AddTile(stop);
-                //AISign.BuildSign(stop, err_str);
                 return false;
             }
             
             /* Build loop. */
-            if(!AIRoad.AreRoadTilesConnected(front, stop)) {
-                WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_ROAD));
-                if(!AIRoad.BuildRoad(front, stop)) {
-                    local err_str = AIError.GetLastErrorString();
-                    local x = AIMap.GetTileX(front);
-                    local y = AIMap.GetTileY(front);
-                    AILog.Error("Failed to tracks at (" + x + "," + y + "): " + err_str);
-                    AIRoad.RemoveRoadStation(stop);
-                    //AISign.BuildSign(front, err_str);
-                    return false;
-                }
-            }
-            if(!AIRoad.AreRoadTilesConnected(back, stop)) {
-                WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_ROAD));
-                if(!AIRoad.BuildRoad(back, stop)) {
-                    local err_str = AIError.GetLastErrorString();
-                    local x = AIMap.GetTileX(back);
-                    local y = AIMap.GetTileY(back);
-                    AILog.Error("Failed to tracks at (" + x + "," + y + "): " + err_str);
-                    AIRoad.RemoveRoadStation(stop);                    
-                    //AISign.BuildSign(back, err_str);
-                    return false;
+            foreach(loop in [front, back]) {
+                if(!AIRoad.AreRoadTilesConnected(loop, stop)) {
+                    WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_ROAD));
+                    if(!AIRoad.BuildRoad(loop, stop)) {
+                        local err = AIError.GetLastError();
+                        if(err == AIError.ERR_OWNED_BY_ANOTHER_COMPANY) {
+                            AIRoad.RemoveRoadStation(stop);
+                            this._ignored.AddTile(stop);
+                        } else if(err != AIError.ERR_VEHICLE_IN_THE_WAY) {
+                            local err_str = AIError.GetLastErrorString();
+                            local x = AIMap.GetTileX(loop);
+                            local y = AIMap.GetTileY(loop);
+                            AILog.Error("Failed to build loop at (" + x + "," + y + "): " + err_str);
+                            AIRoad.RemoveRoadStation(stop);
+                            //AISign.BuildSign(stop, err_str);
+                        }
+                        return false;
+                    }
                 }
             }
         }
@@ -342,42 +476,18 @@ function TramAI::GetDepot(town) {
     /* Build the depot and connect it to the road. */
     local tile = tiles.Begin();
     WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_DEPOT));
-    if(AIRoad.IsRoadTile(tile + NORTH)) {
-        if(AIRoad.BuildRoadDepot(tile, tile + NORTH)) {
-            AIRoad.BuildRoad(tile + NORTH, tile);
-            return tile;
-        } 
-        local err_str = AIError.GetLastErrorString();
-        local x = AIMap.GetTileX(tile);
-        local y = AIMap.GetTileY(tile);
-        AILog.Error("Failed to build depot at (" + x + "," + y + "): " + err_str);
-    } else if(AIRoad.IsRoadTile(tile + SOUTH)) {
-        if(AIRoad.BuildRoadDepot(tile, tile + SOUTH)) {
-            AIRoad.BuildRoad(tile + SOUTH, tile);
-            return tile;
-        } 
-        local err_str = AIError.GetLastErrorString();
-        local x = AIMap.GetTileX(tile);
-        local y = AIMap.GetTileY(tile);
-        AILog.Error("Failed to build depot at (" + x + "," + y + "): " + err_str);
-    } else if(AIRoad.IsRoadTile(tile + EAST)) {
-        if(AIRoad.BuildRoadDepot(tile, tile + EAST)) {
-            AIRoad.BuildRoad(tile + EAST, tile);
-            return tile;
-        } 
-        local err_str = AIError.GetLastErrorString();
-        local x = AIMap.GetTileX(tile);
-        local y = AIMap.GetTileY(tile);
-        AILog.Error("Failed to build depot at (" + x + "," + y + "): " + err_str);
-    } else {
-        if(AIRoad.BuildRoadDepot(tile, tile + WEST)) {
-            AIRoad.BuildRoad(tile + WEST, tile);
-            return tile;
-        } 
-        local err_str = AIError.GetLastErrorString();
-        local x = AIMap.GetTileX(tile);
-        local y = AIMap.GetTileY(tile);
-        AILog.Error("Failed to build depot at (" + x + "," + y + "): " + err_str);
+    foreach(dir in [NORTH, SOUTH, EAST, WEST]) {
+        if(AIRoad.IsRoadTile(tile + dir) || AIRoad.IsDriveThroughRoadStationTile(tile + dir)) {
+            if(AIRoad.BuildRoadDepot(tile, tile + dir)) {
+                AIRoad.BuildRoad(tile + dir, tile);
+                AILog.Info("Depot built in " + AITown.GetName(town));
+                return tile;
+            }
+            local err_str = AIError.GetLastErrorString();
+            local x = AIMap.GetTileX(tile);
+            local y = AIMap.GetTileY(tile);
+            AILog.Error("Failed to build depot at (" + x + "," + y + "): " + err_str);
+        }
     }
     
     return -1;
@@ -405,28 +515,29 @@ function TramAI::AreConnected(src, dst) {
 
 function TramAI::BuildTrack(src, dst) {
     if(!_pf.FindPath(src, dst)) {
-        AILog.Error("Weird, no path...");
+        AILog.Error("No path found to build track");
         return false;
     }
     
     local tmp_path = _pf.path;
-    //AISign.BuildSign(src, "src");
     while(tmp_path != null) {
         if(tmp_path.prev != null) {
-        
              if(AIBridge.IsBridgeTile(tmp_path.tile)) {
                 /* Bridge. */
                 local other_end = AIBridge.GetOtherBridgeEnd(tmp_path.tile);
                 if(!AIRoad.AreRoadTilesConnected(other_end, tmp_path.prev.tile)) {
                     WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_ROAD));
                     if(!AIRoad.BuildRoad(other_end, tmp_path.prev.tile) && !AIRoad.BuildRoad(tmp_path.prev.tile, other_end)) {
-                        local err_str = AIError.GetLastErrorString();
-                        local x = AIMap.GetTileX(other_end);
-                        local y = AIMap.GetTileY(other_end);
-                        local x2 = AIMap.GetTileX(tmp_path.prev.tile);
-                        local y2 = AIMap.GetTileY(tmp_path.prev.tile);
-                        AILog.Error("Failed to build track between (" + x + "," + y + ") and (" + x2 + "," + y2 + "): " + err_str);
-                        //AISign.BuildSign(tmp_path.tile, "x");
+                        local err = AIError.GetLastError();
+                        if(err != AIError.ERR_VEHICLE_IN_THE_WAY) {
+                            local err_str = AIError.GetLastErrorString();
+                            local x = AIMap.GetTileX(other_end);
+                            local y = AIMap.GetTileY(other_end);
+                            local x2 = AIMap.GetTileX(tmp_path.prev.tile);
+                            local y2 = AIMap.GetTileY(tmp_path.prev.tile);
+                            AILog.Error("Failed to build track between (" + x + "," + y + ") and (" + x2 + "," + y2 + "): " + err_str);
+                            //AISign.BuildSign(tmp_path.tile, err_str);
+                        }
                         return false;
                     }
                 }
@@ -435,26 +546,24 @@ function TramAI::BuildTrack(src, dst) {
                 if(!AIRoad.AreRoadTilesConnected(tmp_path.tile, tmp_path.prev.tile)) {
                     WaitToHaveEnoughMoney(AIRoad.GetBuildCost(AIRoad.ROADTYPE_TRAM, AIRoad.BT_ROAD));
                      if(!AIRoad.BuildRoad(tmp_path.tile, tmp_path.prev.tile) && !AIRoad.BuildRoad(tmp_path.prev.tile, tmp_path.tile)) {
-                        local err_str = AIError.GetLastErrorString();
-                        local x = AIMap.GetTileX(tmp_path.tile);
-                        local y = AIMap.GetTileY(tmp_path.tile);
-                        local x2 = AIMap.GetTileX(tmp_path.prev.tile);
-                        local y2 = AIMap.GetTileY(tmp_path.prev.tile);
-                        AILog.Error("Failed to build track between (" + x + "," + y + ") and (" + x2 + "," + y2 + "): " + err_str);
-                        //AISign.BuildSign(tmp_path.tile, "x");
+                        local err = AIError.GetLastError();
+                        if(err != AIError.ERR_VEHICLE_IN_THE_WAY) {
+                            local err_str = AIError.GetLastErrorString();
+                            local x = AIMap.GetTileX(tmp_path.tile);
+                            local y = AIMap.GetTileY(tmp_path.tile);
+                            local x2 = AIMap.GetTileX(tmp_path.prev.tile);
+                            local y2 = AIMap.GetTileY(tmp_path.prev.tile);
+                            AILog.Error("Failed to build track between (" + x + "," + y + ") and (" + x2 + "," + y2 + "): " + err_str);
+                            //AISign.BuildSign(tmp_path.tile, err_str);
+                        }
                         return false;
                     }
                 }
             }
-             
-            //AISign.BuildSign(tmp_path.tile, "t");
-            //AISign.BuildSign(tmp_path.prev.tile, "p");
         }        
         tmp_path = tmp_path.prev;
     }
     
-    //AISign.BuildSign(src, "dst");
-
     return true;
 }
 
@@ -564,12 +673,3 @@ function TramAI::SetCompanyName() {
     }
 }
 
-/* Gets passengers cargo ID. */
-function GetPassengersCargoID() {
-    local cargo_list = AICargoList();
-    cargo_list.Valuate(AICargo.HasCargoClass, AICargo.CC_PASSENGERS);
-    cargo_list.KeepValue(1);
-    cargo_list.Valuate(AICargo.GetTownEffect);
-    cargo_list.KeepValue(AICargo.TE_PASSENGERS);
-    return cargo_list.Begin();
-}
